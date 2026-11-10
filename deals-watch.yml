@@ -2,7 +2,7 @@ name: deals-watch
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # كل 15 دقيقة (GitHub ممكن يتأخر شوية)
+    - cron: "*/5 * * * *"   # كل 15 دقيقة (GitHub ممكن يتأخر شوية)
   workflow_dispatch:          # تشغيل يدوي من تاب Actions
 
 concurrency:
