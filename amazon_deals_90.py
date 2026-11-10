@@ -8,10 +8,10 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # ============ الإعدادات ============
-BOT_TOKEN = "[REDACTED]"
+BOT_TOKEN = "ضع_التوكن_الجديد_هنا"
 CHAT_ID = "***REMOVED***"
 
-MIN_DISCOUNT = 70# ابعتلي أي منتج خصمه >= الرقم ده
+MIN_DISCOUNT = 90  # ابعتلي أي منتج خصمه >= الرقم ده
 
 HEADLESS = True    # True = في الخلفية من غير نافذة، False = يظهر المتصفح (لو المواقع بدأت تحجب)
 
@@ -23,16 +23,16 @@ AMAZON_PAGES = [
 
 # صفحات جوميا مصر اللي هيفحصها كل لفّة
 JUMIA_PAGES = [
-    "https://www.jumia.com.eg/ar/mens-fashion/",
+    "https://www.jumia.com.eg/",
     "https://www.jumia.com.eg/ar/mlp-black-friday/",
     # نصيحة: افتح قسم في جوميا (موبايلات، إلكترونيات...) واستخدم فلتر الخصم لو موجود
     # وبعدين انسخ اللينك من المتصفح وحطه هنا، مثلاً:
     # "https://www.jumia.com.eg/mobile-phones/",
 ]
 
-MIN_DELAY = 70   # فاصل بين كل لفّة (ثواني)
-MAX_DELAY = 130
-SCROLLS = 30      # عدد مرات النزول في الصفحة عشان يحمّل منتجات أكتر
+MIN_DELAY = 60   # فاصل بين كل لفّة (ثواني)
+MAX_DELAY = 120
+SCROLLS = 8      # عدد مرات النزول في الصفحة عشان يحمّل منتجات أكتر
 # ===================================
 
 # كل موقع: اسمه، قايمة صفحاته، selector للينكات المنتجات، وطريقة استخراج ID المنتج
@@ -83,7 +83,10 @@ DISCOUNT_PATTERNS = [
     r"(?<![\w.])-\s*(\d{1,3})\s*%",
 ]
 
-BLOCK_WORDS = ["captcha", "robot check", "just a moment", "attention required", "access denied"]
+BLOCK_WORDS = [
+    "captcha", "robot check", "just a moment", "attention required", "access denied",
+    "verify you are human", "not a robot", "enter the characters",
+]
 
 
 def log(msg):
@@ -112,10 +115,17 @@ def best_discount(text):
 
 def scan(page, url, site):
     page.goto(url, wait_until="domcontentloaded", timeout=45000)
-    html = page.content().lower()
-    if any(w in html for w in BLOCK_WORDS):
-        return "BLOCKED"
     page.wait_for_timeout(2500)
+    # بنفحص النص الظاهر والعنوان بس (مش كود الصفحة)، وبس لو الصفحة صغيرة
+    # عشان صفحات الحجب بتبقى قصيرة، وصفحات المنتجات العادية فيها كلمة captcha في السكريبتات
+    title = (page.title() or "").lower()
+    try:
+        body = page.inner_text("body")
+    except Exception:
+        body = ""
+    if len(body) < 2500 and any(w in f"{title} {body.lower()}" for w in BLOCK_WORDS):
+        log(f"صفحة حجب؟ العنوان: {title[:80]!r} - طول النص: {len(body)}")
+        return "BLOCKED"
     found = {}
     for _ in range(SCROLLS):
         for item in page.evaluate(JS_COLLECT, site["selector"]):
@@ -124,6 +134,8 @@ def scan(page, url, site):
                 found[key] = item
         page.mouse.wheel(0, 1800)
         page.wait_for_timeout(1200)
+    if not found:
+        log(f"مفيش منتجات اتقرت. العنوان: {title[:80]!r} - طول النص: {len(body)}")
     return found
 
 
