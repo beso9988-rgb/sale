@@ -8,10 +8,10 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # ============ الإعدادات ============
-BOT_TOKEN = "ضع_التوكن_الجديد_هنا"
+BOT_TOKEN = "[REDACTED]"
 CHAT_ID = "***REMOVED***"
 
-MIN_DISCOUNT = 90  # ابعتلي أي منتج خصمه >= الرقم ده
+MIN_DISCOUNT = 70  # ابعتلي أي منتج خصمه >= الرقم ده
 
 HEADLESS = True    # True = في الخلفية من غير نافذة، False = يظهر المتصفح (لو المواقع بدأت تحجب)
 
@@ -23,8 +23,8 @@ AMAZON_PAGES = [
 
 # صفحات جوميا مصر اللي هيفحصها كل لفّة
 JUMIA_PAGES = [
-    "https://www.jumia.com.eg/",
-    "https://www.jumia.com.eg/ar/mlp-black-friday/",
+    "https://www.jumia.com.eg/ar/flash-sales/",
+    "https://www.jumia.com.eg/ar/mlp-wow-deals/",
     # نصيحة: افتح قسم في جوميا (موبايلات، إلكترونيات...) واستخدم فلتر الخصم لو موجود
     # وبعدين انسخ اللينك من المتصفح وحطه هنا، مثلاً:
     # "https://www.jumia.com.eg/mobile-phones/",
@@ -32,7 +32,7 @@ JUMIA_PAGES = [
 
 MIN_DELAY = 60   # فاصل بين كل لفّة (ثواني)
 MAX_DELAY = 120
-SCROLLS = 8      # عدد مرات النزول في الصفحة عشان يحمّل منتجات أكتر
+SCROLLS = 15      # عدد مرات النزول في الصفحة عشان يحمّل منتجات أكتر
 # ===================================
 
 # كل موقع: اسمه، قايمة صفحاته، selector للينكات المنتجات، وطريقة استخراج ID المنتج
