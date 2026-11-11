@@ -70,9 +70,12 @@ JS_COLLECT = """
     let c = el, best = el.parentElement || el;
     for (let i = 0; i < 8 && c.parentElement; i++) {
       c = c.parentElement;
+      // ما نطلعش لحد الصفحة كلها: نقف لو وصلنا لمنطقة فيها قايمة/هيدر/فلاتر
+      if (/^(MAIN|BODY|HTML)$/.test(c.tagName)) break;
+      if (c.querySelector('header, nav, footer, form, select, input')) break;
       const n = [...c.querySelectorAll(SEL)].filter(isBook).length;
       const t = (c.innerText || '').trim();
-      if (n > 1 || t.length > 800) break;
+      if (n > 1 || t.length > 600 || t.split('\\n').length > 14) break;
       best = c;
     }
     const text = (best.innerText || '').trim();
@@ -111,6 +114,8 @@ JS_COLLECT = """
   return out;
 }
 """
+
+NAV_NOISE = re.compile(r"\bfaq\b|about tazkarti|our stores|stadium locations|الأسئلة الشائعة", re.I)
 
 BLOCK_WORDS = ["captcha", "just a moment", "attention required", "access denied",
                "verify you are human", "not a robot", "forbidden"]
@@ -211,6 +216,8 @@ def scan(page, url, first_run):
         lines = clean_lines(c["text"])
         if len(lines) < 2:
             continue
+        if NAV_NOISE.search(" ".join(lines)):
+            continue   # ده مش كارت ماتش، ده قايمة الموقع
         if TEAMS_FILTER and not any(t.lower() in " ".join(c["teams"] + lines).lower() for t in TEAMS_FILTER):
             continue
         href = c["href"]
