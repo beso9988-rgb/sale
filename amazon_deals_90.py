@@ -9,7 +9,7 @@ from playwright.sync_api import sync_playwright
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # ============ الإعدادات ============
 
-CHAT_ID = "***REMOVED***"
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 MIN_DISCOUNT = 70  # ابعتلي أي منتج خصمه >= الرقم ده
 
