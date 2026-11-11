@@ -17,7 +17,7 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # ============ الإعدادات ============
-BOT_TOKEN = "[REDACTED]"
+BOT_TOKEN = "ضع_التوكن_الجديد_هنا"
 CHAT_ID = "***REMOVED***"
 
 # افتح موقع تذكرتي في متصفحك، ادخل على صفحة المباريات، وانسخ اللينك من شريط العنوان وحطه هنا.
@@ -34,7 +34,7 @@ TEAMS_FILTER = [
 
 MIN_DELAY = 45      # فاصل بين كل فحص (ثواني) - في التشغيل على جهازك بس
 MAX_DELAY = 90
-HEADLESS = True    # False = يظهر نافذة إيدج (الأضمن)، True = في الخلفية
+HEADLESS = False    # False = يظهر نافذة إيدج (الأضمن)، True = في الخلفية
 SAVE_DEBUG = True   # يحفظ صورة ونص الصفحة في أول فحص (فولدر Documents)
 RENOTIFY_AFTER_HOURS = 6   # لو ماتش اختفى ورجع متاح، ما يبلغش تاني قبل الفترة دي
 # ===================================
@@ -49,29 +49,65 @@ if CLOUD:
     HEADLESS = True
 
 STATE_FILE = "seen_tazkarti.json"
+STATE_VERSION = 2
 
 JS_COLLECT = """
 ({book, bad}) => {
   const bookRe = new RegExp(book, 'i'), badRe = new RegExp(bad, 'i');
+  const SEL = 'a, button, [role="button"], .btn';
+  const isBook = (el) => {
+    const l = (el.innerText || el.value || '').trim();
+    return l && l.length <= 40 && bookRe.test(l);
+  };
+  const els = [...document.querySelectorAll(SEL)].filter(el => !el.closest('header, nav, footer') && isBook(el));
   const out = [];
-  for (const el of document.querySelectorAll('a, button, [role="button"], .btn')) {
-    if (el.closest('header, nav, footer')) continue;
+  els.forEach((el, idx) => {
+    el.setAttribute('data-tzk', String(idx));
     const label = (el.innerText || el.value || '').trim();
-    if (!label || label.length > 40 || !bookRe.test(label)) continue;
     const disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true' ||
                      /disabled/i.test(el.className || '');
-    let c = el, text = '';
-    for (let i = 0; i < 6 && c.parentElement; i++) {
+    // نطلع لفوق طول ما الكارت فيه زرار حجز واحد بس والنص مش طويل
+    let c = el, best = el.parentElement || el;
+    for (let i = 0; i < 8 && c.parentElement; i++) {
       c = c.parentElement;
+      const n = [...c.querySelectorAll(SEL)].filter(isBook).length;
       const t = (c.innerText || '').trim();
-      if (t.length > 600) break;
-      text = t;
-      if (t.split('\\n').length >= 4) break;
+      if (n > 1 || t.length > 800) break;
+      best = c;
     }
-    if (text.split('\\n').length < 2) continue;
-    const a = el.closest('a[href]') || c.querySelector('a[href*="#/"]');
-    out.push({label, disabled, text, href: a ? a.href : '', bad: badRe.test(text) || badRe.test(label)});
-  }
+    const text = (best.innerText || '').trim();
+    if (text.split('\\n').length < 2) return;
+
+    // أسماء الفرق من alt/title بتاع الصور (الشعارات)
+    const teams = [];
+    best.querySelectorAll('img').forEach(im => {
+      const n = (im.alt || im.title || '').trim();
+      if (n && n.length < 40 && !/logo|icon|stadium|ticket|tazkarti/i.test(n) && !teams.includes(n)) teams.push(n);
+    });
+
+    // لينك الماتش
+    let href = '';
+    const a = el.closest('a[href]') || best.querySelector('a[href]');
+    if (a) {
+      const raw = a.getAttribute('href') || '';
+      if (raw && raw !== '#' && !raw.startsWith('javascript')) href = a.href;
+    }
+    if (!href) {
+      for (const node of [el, ...best.querySelectorAll('*')]) {
+        for (const attr of ['routerlink', 'ng-reflect-router-link', 'data-href', 'data-url']) {
+          const v = node.getAttribute && node.getAttribute(attr);
+          if (v && /\\d/.test(v)) {
+            href = v.startsWith('http') ? v : location.origin + '/#' + (v.startsWith('/') ? v : '/' + v);
+            break;
+          }
+        }
+        if (href) break;
+      }
+    }
+    out.push({idx, label, disabled, text, teams, href,
+              bad: badRe.test(text) || badRe.test(label),
+              html: idx < 3 ? best.outerHTML.slice(0, 2500) : ''});
+  });
   return out;
 }
 """
@@ -97,13 +133,15 @@ def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             st = json.load(f)
+        if st.get("ver") != STATE_VERSION:
+            raise ValueError("old state")
         st.setdefault("avail", [])
         st.setdefault("last_notified", {})
         st.setdefault("last_block_alert", 0)
         st.setdefault("baseline_done", False)
         return st
     except Exception:
-        return {"avail": [], "last_notified": {}, "last_block_alert": 0, "baseline_done": False}
+        return {"ver": STATE_VERSION, "avail": [], "last_notified": {}, "last_block_alert": 0, "baseline_done": False}
 
 
 def save_state(st):
@@ -145,38 +183,80 @@ def scan(page, url, first_run):
     title = (page.title() or "").lower()
     body = page.inner_text("body")
 
+    if len(body) < 2500 and any(w in f"{title} {body.lower()}" for w in BLOCK_WORDS):
+        return "BLOCKED", {}
+
+    cands = page.evaluate(JS_COLLECT, {"book": BOOK_RE, "bad": UNAVAILABLE_RE})
+
     if first_run and SAVE_DEBUG:
+        samples = "\n\n".join(f"--- كارت {c['idx']} ---\n{c['html']}" for c in cands if c.get("html"))
         if CLOUD:
-            log(f"عنوان الصفحة: {title!r} - طول النص: {len(body)}")
+            log(f"عنوان الصفحة: {title!r} - طول النص: {len(body)} - أزرار حجز: {len(cands)}")
             log("بداية النص:\n" + body[:1500])
+            log("HTML الكروت:\n" + samples[:3000])
         else:
             try:
                 folder = os.path.join(os.path.expanduser("~"), "Documents")
                 page.screenshot(path=os.path.join(folder, "tazkarti_debug.png"), full_page=True)
                 with open(os.path.join(folder, "tazkarti_debug.txt"), "w", encoding="utf-8") as f:
-                    f.write(f"URL: {page.url}\nTitle: {title}\n\n{body}")
+                    f.write(f"URL: {page.url}\nTitle: {title}\n\n{body}\n\n=== HTML الكروت ===\n{samples}")
                 log(f"حفظت ملفات الفحص في: {folder}")
             except Exception as e:
                 log(f"ماقدرتش أحفظ ملفات الفحص (مش مشكلة): {e}")
 
-    if len(body) < 2500 and any(w in f"{title} {body.lower()}" for w in BLOCK_WORDS):
-        return "BLOCKED", {}
-
     found = {}
-    for c in page.evaluate(JS_COLLECT, {"book": BOOK_RE, "bad": UNAVAILABLE_RE}):
+    for c in cands:
         if c["disabled"] or c["bad"]:
             continue
         lines = clean_lines(c["text"])
         if len(lines) < 2:
             continue
-        if TEAMS_FILTER and not any(t.lower() in " ".join(lines).lower() for t in TEAMS_FILTER):
+        if TEAMS_FILTER and not any(t.lower() in " ".join(c["teams"] + lines).lower() for t in TEAMS_FILTER):
             continue
-        found[make_key(lines, c["href"])] = {"lines": lines[:6], "href": c["href"] or url}
+        href = c["href"]
+        if not href or href.rstrip("#/") == url.rstrip("#/"):
+            href = ""
+        found[make_key(c["teams"] + lines, href)] = {
+            "lines": lines[:8], "teams": c["teams"][:2], "href": href, "idx": c["idx"], "url": url,
+        }
     return ("OK" if found else "EMPTY"), found
 
 
 def describe(info):
-    return "\n".join(info["lines"][:5])
+    lines = [ln for ln in info["lines"] if not (len(ln) <= 40 and re.search(BOOK_RE, ln, re.I))]
+    parts = []
+    if info["teams"]:
+        parts.append("⚽ " + "  🆚  ".join(info["teams"]))
+    parts += lines[:5]
+    return "\n".join(parts)
+
+
+def resolve_link(page, info):
+    """لو اللينك مش ظاهر في الصفحة: بنضغط على زرار الحجز بس عشان نقرا اللينك اللي بيفتحه (مابنحجزش حاجة)."""
+    try:
+        ctx = page.context
+        page.goto("about:blank")
+        page.goto(info["url"], wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            pass
+        page.wait_for_timeout(5000)
+        page.evaluate(JS_COLLECT, {"book": BOOK_RE, "bad": UNAVAILABLE_RE})   # بيعيد وسم الأزرار
+        before, count = page.url, len(ctx.pages)
+        page.locator(f'[data-tzk="{info["idx"]}"]').first.click(timeout=8000)
+        page.wait_for_timeout(3500)
+        target = page.url
+        if len(ctx.pages) > count:
+            extra = ctx.pages[-1]
+            target = extra.url
+            extra.close()
+        low = target.lower()
+        if target and target != before and "login" not in low and "signin" not in low:
+            return target
+    except Exception as e:
+        log(f"ماقدرتش أجيب لينك الحجز: {e}")
+    return ""
 
 
 def process(page, state, first_run):
@@ -211,7 +291,9 @@ def process(page, state, first_run):
         state["baseline_done"] = True
         state["avail"] = list(current)
         if current:
-            listing = "\n\n".join(describe(i) for i in list(current.values())[:8])
+            listing = "\n\n".join(
+                describe(i) + (f"\n🔗 {i['href']}" if i["href"] else "") for i in list(current.values())[:8]
+            )
             send_telegram(f"🧪 اختبار: المتاح للحجز دلوقتي ({len(current)}):\n\n{listing}")
         else:
             send_telegram("🧪 اختبار: الصفحة اتفتحت بس مفيش ماتشات متاحة للحجز دلوقتي. هبلغك أول ما يتفتح حجز.")
@@ -221,8 +303,11 @@ def process(page, state, first_run):
         last = state["last_notified"].get(key, 0)
         if key not in prev and now - last > RENOTIFY_AFTER_HOURS * 3600:
             state["last_notified"][key] = now
-            send_telegram(f"🎟️ متاح للحجز دلوقتي:\n\n{describe(info)}\n\n{info['href']}")
-            log(f"إشعار: {info['lines'][:2]}")
+            link = info["href"] or resolve_link(page, info)
+            if not link:
+                link = f"{info['url']}\n(افتح الصفحة واختار الماتش)"
+            send_telegram(f"🎟️ ماتش متاح للحجز دلوقتي:\n\n{describe(info)}\n\n🔗 {link}")
+            log(f"إشعار: {info['teams'] or info['lines'][:2]}")
     state["avail"] = list(current)
 
 
