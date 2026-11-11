@@ -1,4 +1,4 @@
-import random
+import os
 import re
 import time
 import urllib.parse
@@ -6,9 +6,9 @@ import urllib.request
 from datetime import datetime
 
 from playwright.sync_api import sync_playwright
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 # ============ الإعدادات ============
-BOT_TOKEN = "[REDACTED]"
+
 CHAT_ID = "***REMOVED***"
 
 MIN_DISCOUNT = 70  # ابعتلي أي منتج خصمه >= الرقم ده
