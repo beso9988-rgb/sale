@@ -56,6 +56,10 @@ API_STATE_FILE = "tazkarti_api_watch.json"
 STATE_VERSION = 3
 API_STATE = {}
 
+# راقب واجهات بيانات المباريات والحجز فقط، وتجاهل ملفات اللغة والموارد الثابتة.
+WATCH_API_SUFFIXES = ("/data/matches-list-json.json", "/data/fanQueuesMatch-list-json.json")
+API_ALERT_COOLDOWN_SECONDS = 300  # منع تكرار التنبيه لنفس الواجهة أكثر من مرة كل 5 دقائق
+
 JS_COLLECT = """
 ({book, bad}) => {
   const bookRe = new RegExp(book, 'i'), badRe = new RegExp(bad, 'i');
@@ -429,31 +433,65 @@ def save_api_state():
 
 
 def attach_api_observer(page):
-    """يسجل تغيّر بصمات استجابات JSON العامة من نطاق تذكرتي، دون حفظ أجسامها أو بياناتها الحساسة."""
+    """يراقب تغيّر واجهات بيانات المباريات/الحجز فقط، ويرسل تنبيهًا عند التغيير دون حفظ أجسام الاستجابات."""
     def on_response(response):
         try:
             parsed = urllib.parse.urlsplit(response.url)
             host = (parsed.hostname or "").lower()
             if host != "tazkarti.com" and not host.endswith(".tazkarti.com"):
                 return
+
+            endpoint = f"{host}{parsed.path}"
+            if not any(parsed.path.endswith(suffix) for suffix in WATCH_API_SUFFIXES):
+                return
+
             content_type = response.headers.get("content-type", "").lower()
             if "json" not in content_type:
                 return
+
             body = response.body()
             if not body or len(body) > 2 * 1024 * 1024:
                 return
+
+            now = int(time.time())
             digest = hashlib.sha256(body).hexdigest()[:20]
-            endpoint = f"{host}{parsed.path}"
             old = API_STATE.get(endpoint)
-            entry = {"sha256": digest, "status": response.status, "last_seen": int(time.time())}
-            API_STATE[endpoint] = entry
+            status_changed = old is not None and old.get("status") != response.status
+            fingerprint_changed = old is not None and old.get("sha256") != digest
+            entry = {
+                "sha256": digest,
+                "status": response.status,
+                "last_seen": now,
+                "last_alert": int((old or {}).get("last_alert", 0)),
+            }
+
             if old is None:
-                log(f"[API_ENDPOINT] {endpoint} status={response.status}")
-            elif old.get("sha256") != digest:
-                log(f"[API_CHANGE] {endpoint} status={response.status} fingerprint_changed=1")
-        except Exception:
+                log(f"[API_ENDPOINT] {endpoint} status={response.status} baseline=1")
+            elif fingerprint_changed or status_changed:
+                log(
+                    f"[API_CHANGE] {endpoint} status={response.status} "
+                    f"fingerprint_changed={int(fingerprint_changed)} "
+                    f"status_changed={int(status_changed)}"
+                )
+                if now - entry["last_alert"] >= API_ALERT_COOLDOWN_SECONDS:
+                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    send_telegram(
+                        "🔎 رصد تغيير في بيانات تذكرتي\\n"
+                        f"الواجهة: {parsed.path}\\n"
+                        f"HTTP: {response.status}\\n"
+                        f"الوقت: {stamp}\\n\\n"
+                        "قد يكون التغيير تحديثًا عاديًا أو إشارة مرتبطة بالمباريات/الحجز؛ "
+                        "ليس تأكيدًا لبدء البيع. راقب الموقع."
+                    )
+                    entry["last_alert"] = now
+                    log(f"[API_ALERT_SENT] {endpoint}")
+                else:
+                    log(f"[API_ALERT_COOLDOWN] {endpoint} alert suppressed")
+
+            API_STATE[endpoint] = entry
+        except Exception as e:
             # فشل تحليل استجابة جانبية لا يجب أن يوقف مراقبة صفحة المباريات.
-            return
+            log(f"[API_OBSERVER_ERROR] {e}")
 
     page.on("response", on_response)
 
