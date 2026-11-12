@@ -17,9 +17,8 @@ from datetime import datetime
 from playwright.sync_api import sync_playwright
 
 # ============ الإعدادات ============
-BOT_TOKEN = "ضع_التوكن_الجديد_هنا"
-CHAT_ID = "***REMOVED***"
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 # افتح موقع تذكرتي في متصفحك، ادخل على صفحة المباريات، وانسخ اللينك من شريط العنوان وحطه هنا.
 # تقدر تحط أكتر من صفحة (مثلاً الدوري + كأس مصر).
 PAGES = [
