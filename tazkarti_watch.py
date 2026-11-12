@@ -31,8 +31,8 @@ TEAMS_FILTER = [
     # "الزمالك",
 ]
 
-MIN_DELAY = 45      # فاصل بين كل فحص (ثواني) - في التشغيل على جهازك بس
-MAX_DELAY = 90
+MIN_DELAY = 300     # فاصل الفحص 5 دقائق - في التشغيل على جهازك بس
+MAX_DELAY = 300
 HEADLESS = False    # False = يظهر نافذة إيدج (الأضمن)، True = في الخلفية
 SAVE_DEBUG = True   # يحفظ صورة ونص الصفحة في أول فحص (فولدر Documents)
 RENOTIFY_AFTER_HOURS = 1   # لو ماتش اختفى ورجع متاح، ما يبلغش تاني قبل الفترة دي
@@ -125,12 +125,31 @@ def log(msg):
 
 
 def send_telegram(text):
+    """يرسل الرسالة على أجزاء عند الحاجة، مع مراعاة حد تليجرام."""
+    if not BOT_TOKEN or not CHAT_ID:
+        log("لم يتم الإرسال: أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID في Secrets/Environment.")
+        return
+
     api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": text[:4000]}).encode()
-    try:
-        urllib.request.urlopen(api, data=data, timeout=15)
-    except Exception as e:
-        log(f"فشل إرسال تليجرام: {e}")
+    remaining = str(text)
+    chunks = []
+    while remaining:
+        if len(remaining) <= 3800:
+            chunks.append(remaining)
+            break
+        cut = remaining.rfind("\n", 0, 3800)
+        if cut < 1000:
+            cut = 3800
+        chunks.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+
+    for chunk in chunks:
+        data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": chunk}).encode()
+        try:
+            with urllib.request.urlopen(api, data=data, timeout=20) as response:
+                response.read()
+        except Exception as e:
+            log(f"فشل إرسال تليجرام: {e}")
 
 
 def load_state():
@@ -237,6 +256,32 @@ def describe(info):
     return "\n".join(parts)
 
 
+def send_availability_report(current):
+    """يرسل تقريرًا كاملًا بالمباريات المتاحة بعد كل فحص ناجح."""
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if not current:
+        send_telegram(
+            f"🎟️ تقرير تذكرتي | {stamp}\n\n"
+            "لا توجد مباريات متاحة للحجز حاليًا."
+        )
+        return
+
+    entries = []
+    for number, info in enumerate(current.values(), start=1):
+        item = f"{number}) {describe(info)}"
+        link = info.get("href") or info.get("url", "")
+        if link:
+            item += f"\n🔗 {link}"
+        entries.append(item)
+
+    report = (
+        f"🎟️ تقرير تذكرتي | {stamp}\n"
+        f"عدد المباريات المتاحة: {len(entries)}\n\n"
+        + "\n\n".join(entries)
+    )
+    send_telegram(report)
+
+
 def resolve_link(page, info):
     """لو اللينك مش ظاهر في الصفحة: بنضغط على زرار الحجز بس عشان نقرا اللينك اللي بيفتحه (مابنحجزش حاجة)."""
     try:
@@ -296,13 +341,7 @@ def process(page, state, first_run):
     if not state["baseline_done"]:
         state["baseline_done"] = True
         state["avail"] = list(current)
-        if current:
-            listing = "\n\n".join(
-                describe(i) + (f"\n🔗 {i['href']}" if i["href"] else "") for i in list(current.values())[:8]
-            )
-            send_telegram(f"🧪 اختبار: المتاح للحجز دلوقتي ({len(current)}):\n\n{listing}")
-        else:
-            send_telegram("🧪 اختبار: الصفحة اتفتحت بس مفيش ماتشات متاحة للحجز دلوقتي. هبلغك أول ما يتفتح حجز.")
+        send_availability_report(current)
         return
 
     for key, info in current.items():
@@ -315,6 +354,7 @@ def process(page, state, first_run):
             send_telegram(f"🎟️ ماتش متاح للحجز دلوقتي:\n\n{describe(info)}\n\n🔗 {link}")
             log(f"إشعار: {info['teams'] or info['lines'][:2]}")
     state["avail"] = list(current)
+    send_availability_report(current)
 
 
 def launch(p):
