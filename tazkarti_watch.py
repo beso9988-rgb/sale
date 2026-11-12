@@ -1,8 +1,9 @@
 """
-مراقب تذكرتي: يبلغك على تليجرام لما أي ماتش (أو حدث) يبقى متاح للحجز.
-بيشتغل بطريقتين:
-  1) على جهازك: python tazkarti_watch.py   (بيفضل شغال ويفحص كل شوية)
-  2) على GitHub Actions: لو متغيّرات TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID موجودة، بيفحص مرة واحدة ويطلع
+مراقب تذكرتي.
+- GitHub Actions: فحص واحد لكل تشغيل مجدول.
+- VPS: عند ضبط TARZKARTI_CONTINUOUS=1 يعمل باستمرار، افتراضيًا كل 60 ثانية.
+- يرسل Telegram عند تغيّر قائمة المباريات فقط، مع تقرير تأسيسي عند أول تشغيل.
+- يسجل تغيّر بصمات استجابات JSON من نطاق تذكرتي للمساعدة في اكتشاف إشارات مبكرة؛ لا يحفظ أجسام الاستجابات.
 """
 import hashlib
 import json
@@ -31,24 +32,29 @@ TEAMS_FILTER = [
     # "الزمالك",
 ]
 
-MIN_DELAY = 300     # فاصل الفحص 5 دقائق - في التشغيل على جهازك بس
-MAX_DELAY = 300
-HEADLESS = False    # False = يظهر نافذة إيدج (الأضمن)، True = في الخلفية
-SAVE_DEBUG = True   # يحفظ صورة ونص الصفحة في أول فحص (فولدر Documents)
-RENOTIFY_AFTER_HOURS = 1   # لو ماتش اختفى ورجع متاح، ما يبلغش تاني قبل الفترة دي
+# على VPS اضبط TARZKARTI_POLL_SECONDS=60 لمراقبة كل دقيقة.
+# ابدأ بفاصل 60 ثانية لتقليل الضغط على الموقع؛ لا توجد ضمانة بتنبيه قبل نزول التذاكر.
+POLL_INTERVAL_SECONDS = max(30, int(os.getenv("TARZKARTI_POLL_SECONDS", "60")))
+HEADLESS = os.getenv("TARZKARTI_HEADLESS", "1").strip() == "1"
+SAVE_DEBUG = True
+RENOTIFY_AFTER_HOURS = 1
 # ===================================
 
 BOOK_RE = "احجز|حجز|اشتر|شراء|book|buy|get tickets"
 UNAVAILABLE_RE = "نفذ|نفد|sold|انتهت|غير متاح|غير متوفر|unavailable|مغلق|closed|قريب|soon|لا توجد"
 
-CLOUD = "TELEGRAM_BOT_TOKEN" in os.environ
-if CLOUD:
-    BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-    CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GITHUB_ACTIONS = os.getenv("GITHUB_ACTIONS", "").lower() == "true"
+CONTINUOUS_MODE = os.getenv("TARZKARTI_CONTINUOUS", "0") == "1" and not GITHUB_ACTIONS
+CLOUD = GITHUB_ACTIONS or CONTINUOUS_MODE
+if GITHUB_ACTIONS:
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
     HEADLESS = True
 
 STATE_FILE = "seen_tazkarti.json"
-STATE_VERSION = 2
+API_STATE_FILE = "tazkarti_api_watch.json"
+STATE_VERSION = 3
+API_STATE = {}
 
 JS_COLLECT = """
 ({book, bad}) => {
@@ -159,12 +165,13 @@ def load_state():
         if st.get("ver") != STATE_VERSION:
             raise ValueError("old state")
         st.setdefault("avail", [])
+        st.setdefault("avail_info", {})
         st.setdefault("last_notified", {})
         st.setdefault("last_block_alert", 0)
         st.setdefault("baseline_done", False)
         return st
     except Exception:
-        return {"ver": STATE_VERSION, "avail": [], "last_notified": {}, "last_block_alert": 0, "baseline_done": False}
+        return {"ver": STATE_VERSION, "avail": [], "avail_info": {}, "last_notified": {}, "last_block_alert": 0, "baseline_done": False}
 
 
 def save_state(st):
@@ -329,48 +336,132 @@ def process(page, state, first_run):
 
     if blocked and now - state["last_block_alert"] > 6 * 3600:
         state["last_block_alert"] = now
-        send_telegram(
-            "⚠️ موقع تذكرتي طلب تحقق أو حجب الفحص."
-            + (" لو بيتكرر على GitHub، شغّله من جهازك." if CLOUD else "")
-        )
+        send_telegram("⚠️ موقع تذكرتي طلب تحقق أو حجب الفحص. أوقفت تغييرات الحالة لتجنب تنبيهات غير صحيحة.")
 
     if not healthy:
-        return  # ماغيّرناش الحالة عشان ما نبعتش إشعارات غلط بعد
+        return
 
-    prev = set(state["avail"])
+    prev_keys = set(state.get("avail", []))
+    prev_info = state.get("avail_info", {}) or {}
+
+    # أول فحص يثبت خط الأساس ويرسل تقريرًا واحدًا فقط.
     if not state["baseline_done"]:
         state["baseline_done"] = True
         state["avail"] = list(current)
+        state["avail_info"] = current
         send_availability_report(current)
         return
 
-    for key, info in current.items():
-        last = state["last_notified"].get(key, 0)
-        if key not in prev and now - last > RENOTIFY_AFTER_HOURS * 3600:
+    current_keys = set(current)
+    added = current_keys - prev_keys
+    removed = prev_keys - current_keys
+    updated = {
+        key for key in (current_keys & prev_keys)
+        if key in prev_info and any(
+            current[key].get(field) != prev_info[key].get(field)
+            for field in ("lines", "teams", "href")
+        )
+    }
+
+    if added:
+        entries = []
+        for number, key in enumerate(sorted(added), start=1):
+            info = current[key]
+            link = info.get("href") or info.get("url", "")
+            entries.append(f"{number}) {describe(info)}" + (f"\n🔗 {link}" if link else ""))
+        send_telegram(
+            "🟢 تغيير في تذكرتي: ظهرت مباراة/مباريات متاحة جديدة\n\n"
+            + "\n\n".join(entries)
+        )
+        for key in added:
             state["last_notified"][key] = now
-            link = info["href"] or resolve_link(page, info)
-            if not link:
-                link = f"{info['url']}\n(افتح الصفحة واختار الماتش)"
-            send_telegram(f"🎟️ ماتش متاح للحجز دلوقتي:\n\n{describe(info)}\n\n🔗 {link}")
-            log(f"إشعار: {info['teams'] or info['lines'][:2]}")
+            log(f"إتاحة جديدة: {current[key]['teams'] or current[key]['lines'][:2]}")
+
+    if updated:
+        entries = [describe(current[key]) for key in sorted(updated)]
+        send_telegram("🔄 تحديث في تفاصيل مباراة على تذكرتي:\n\n" + "\n\n".join(entries))
+
+    if removed:
+        entries = []
+        for key in sorted(removed):
+            info = prev_info.get(key)
+            if info:
+                entries.append(describe(info))
+        if entries:
+            send_telegram("⚪ لم تعد هذه المباراة ظاهرة كمتاحة للحجز:\n\n" + "\n\n".join(entries))
+        else:
+            send_telegram(f"⚪ تغيّرت قائمة المباريات المتاحة: اختفى {len(removed)} عنصر/عناصر من القائمة.")
+
+    if not added and not removed and not updated:
+        log("لا يوجد تغيير في قائمة المباريات المتاحة؛ لن يتم إرسال رسالة.")
+
     state["avail"] = list(current)
-    send_availability_report(current)
+    state["avail_info"] = current
 
 
 def launch(p):
-    args = ["--disable-blink-features=AutomationControlled"]
-    if not CLOUD:
+    args = ["--no-sandbox", "--disable-blink-features=AutomationControlled"]
+    if not HEADLESS and not CLOUD:
         try:
-            b = p.chromium.launch(headless=HEADLESS, channel="msedge", args=args)
+            b = p.chromium.launch(headless=False, channel="msedge", args=args)
             log("شغّال بإيدج الحقيقي")
             return b
         except Exception as e:
             log(f"إيدج مش متاح ({e}) هستخدم Chromium العادي")
-    return p.chromium.launch(headless=HEADLESS, args=args)
+    return p.chromium.launch(headless=True if CLOUD else HEADLESS, args=args)
+
+
+def load_api_state():
+    try:
+        with open(API_STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_api_state():
+    try:
+        with open(API_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(API_STATE, f, ensure_ascii=False)
+    except Exception as e:
+        log(f"ماقدرتش أحفظ سجل مراقبة API: {e}")
+
+
+def attach_api_observer(page):
+    """يسجل تغيّر بصمات استجابات JSON العامة من نطاق تذكرتي، دون حفظ أجسامها أو بياناتها الحساسة."""
+    def on_response(response):
+        try:
+            parsed = urllib.parse.urlsplit(response.url)
+            host = (parsed.hostname or "").lower()
+            if host != "tazkarti.com" and not host.endswith(".tazkarti.com"):
+                return
+            content_type = response.headers.get("content-type", "").lower()
+            if "json" not in content_type:
+                return
+            body = response.body()
+            if not body or len(body) > 2 * 1024 * 1024:
+                return
+            digest = hashlib.sha256(body).hexdigest()[:20]
+            endpoint = f"{host}{parsed.path}"
+            old = API_STATE.get(endpoint)
+            entry = {"sha256": digest, "status": response.status, "last_seen": int(time.time())}
+            API_STATE[endpoint] = entry
+            if old is None:
+                log(f"[API_ENDPOINT] {endpoint} status={response.status}")
+            elif old.get("sha256") != digest:
+                log(f"[API_CHANGE] {endpoint} status={response.status} fingerprint_changed=1")
+        except Exception:
+            # فشل تحليل استجابة جانبية لا يجب أن يوقف مراقبة صفحة المباريات.
+            return
+
+    page.on("response", on_response)
 
 
 def main():
+    global API_STATE
     state = load_state()
+    API_STATE = load_api_state()
     with sync_playwright() as p:
         browser = launch(p)
         context = browser.new_context(
@@ -382,23 +473,29 @@ def main():
             ),
         )
         page = context.new_page()
+        attach_api_observer(page)
 
-        if CLOUD:
+        if GITHUB_ACTIONS or os.getenv("TARZKARTI_RUN_ONCE", "0") == "1":
             try:
                 process(page, state, first_run=not state["baseline_done"])
             finally:
                 save_state(state)
-            browser.close()
+                save_api_state()
+                browser.close()
             return
 
-        send_telegram("✅ مراقب تذكرتي اشتغل")
+        mode_name = "السيرفر" if CONTINUOUS_MODE else "التشغيل المحلي"
+        send_telegram(f"✅ مراقب تذكرتي بدأ العمل على {mode_name}. الفحص الدوري كل {POLL_INTERVAL_SECONDS} ثانية.")
+        log(f"بدء المراقبة المستمرة؛ الفاصل {POLL_INTERVAL_SECONDS} ثانية")
         while True:
             try:
                 process(page, state, first_run=not state["baseline_done"])
                 save_state(state)
+                save_api_state()
             except Exception as e:
-                log(f"خطأ: {e}")
-            time.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
+                log(f"خطأ أثناء دورة المراقبة: {e}")
+                save_api_state()
+            time.sleep(POLL_INTERVAL_SECONDS)
 
 
 if __name__ == "__main__":
