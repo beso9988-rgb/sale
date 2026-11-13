@@ -509,6 +509,18 @@ def _collect_json_changes(old_value, new_value, path="$", depth=0, output=None):
             else:
                 _collect_json_changes(old_value[key], new_value[key], child_path, depth + 1, output)
         return output
+    if isinstance(old_value, list) and isinstance(new_value, list) and depth < 5:
+        if len(old_value) != len(new_value):
+            output.append({
+                "field": f"{path}.length",
+                "old": len(old_value),
+                "new": len(new_value),
+            })
+        for index, (old_item, new_item) in enumerate(zip(old_value, new_value)):
+            if len(output) >= API_DIFF_MAX_FIELDS:
+                break
+            _collect_json_changes(old_item, new_item, f"{path}[{index}]", depth + 1, output)
+        return output
     if old_value != new_value:
         output.append({"field": path, "old": _short_value(old_value), "new": _short_value(new_value)})
     return output
