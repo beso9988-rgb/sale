@@ -174,11 +174,12 @@ def load_state():
         st.setdefault("avail", [])
         st.setdefault("avail_info", {})
         st.setdefault("last_notified", {})
+        st.setdefault("removed_notified", {})
         st.setdefault("last_block_alert", 0)
         st.setdefault("baseline_done", False)
         return st
     except Exception:
-        return {"ver": STATE_VERSION, "avail": [], "avail_info": {}, "last_notified": {}, "last_block_alert": 0, "baseline_done": False}
+        return {"ver": STATE_VERSION, "avail": [], "avail_info": {}, "last_notified": {}, "removed_notified": {}, "last_block_alert": 0, "baseline_done": False}
 
 
 def save_state(st):
@@ -259,6 +260,25 @@ def scan(page, url, first_run):
             "lines": lines[:8], "teams": c["teams"][:2], "href": href, "idx": c["idx"], "url": url,
         }
     return ("OK" if found else "EMPTY"), found
+
+
+def match_identity(info):
+    """مفتاح ثابت للمباراة يتجاهل تغيّر زر الحجز أو حالة الإتاحة والنصوص المؤقتة."""
+    stable_lines = []
+    for line in info.get("lines", []):
+        value = re.sub(r"\s+", " ", str(line)).strip().lower()
+        if not value:
+            continue
+        if re.search(BOOK_RE, value, re.I) or re.search(UNAVAILABLE_RE, value, re.I):
+            continue
+        if re.fullmatch(r"available|view more|book ticket|group stage|متاح|عرض المزيد", value, re.I):
+            continue
+        stable_lines.append(value)
+    teams = [re.sub(r"\s+", " ", str(x)).strip().lower() for x in info.get("teams", []) if str(x).strip()]
+    basis = "|".join(teams + stable_lines)
+    if not basis:
+        basis = "|".join(info.get("lines", [])[:3])
+    return hashlib.sha256(basis.encode("utf-8")).hexdigest()[:20]
 
 
 def describe(info):
@@ -350,6 +370,7 @@ def process(page, state, first_run):
 
     prev_keys = set(state.get("avail", []))
     prev_info = state.get("avail_info", {}) or {}
+    removed_notified = state.setdefault("removed_notified", {})
 
     # أول فحص يثبت خط الأساس ويرسل تقريرًا واحدًا فقط.
     if not state["baseline_done"]:
@@ -359,47 +380,67 @@ def process(page, state, first_run):
         send_availability_report(current)
         return
 
-    current_keys = set(current)
-    added = current_keys - prev_keys
-    removed = prev_keys - current_keys
-    updated = {
-        key for key in (current_keys & prev_keys)
-        if key in prev_info and any(
-            current[key].get(field) != prev_info[key].get(field)
+    # قارن بهوية المباراة الثابتة، لا ببصمة النص الكامل التي قد تتغير مع زر الحجز.
+    prev_by_identity = {}
+    for key in prev_keys:
+        info = prev_info.get(key)
+        if info:
+            prev_by_identity[match_identity(info)] = info
+
+    current_by_identity = {}
+    for key, info in current.items():
+        current_by_identity[match_identity(info)] = info
+
+    prev_ids = set(prev_by_identity)
+    current_ids = set(current_by_identity)
+    added_ids = current_ids - prev_ids
+    removed_ids = prev_ids - current_ids
+    updated_ids = {
+        identity for identity in (current_ids & prev_ids)
+        if any(
+            current_by_identity[identity].get(field) != prev_by_identity[identity].get(field)
             for field in ("lines", "teams", "href")
         )
     }
 
-    if added:
+    # ظهور المباراة مجددًا يعيد تسليح تنبيه الاختفاء للدورة القادمة.
+    for identity in current_ids:
+        removed_notified.pop(identity, None)
+
+    if added_ids:
         entries = []
-        for number, key in enumerate(sorted(added), start=1):
-            info = current[key]
+        for number, identity in enumerate(sorted(added_ids), start=1):
+            info = current_by_identity[identity]
             link = info.get("href") or info.get("url", "")
             entries.append(f"{number}) {describe(info)}" + (f"\n🔗 {link}" if link else ""))
         send_telegram(
             "🟢 تغيير في تذكرتي: ظهرت مباراة/مباريات متاحة جديدة\n\n"
             + "\n\n".join(entries)
         )
-        for key in added:
-            state["last_notified"][key] = now
-            log(f"إتاحة جديدة: {current[key]['teams'] or current[key]['lines'][:2]}")
+        for identity in added_ids:
+            log(f"إتاحة جديدة: {current_by_identity[identity]['teams'] or current_by_identity[identity]['lines'][:2]}")
 
-    if updated:
-        entries = [describe(current[key]) for key in sorted(updated)]
+    if updated_ids:
+        entries = [describe(current_by_identity[identity]) for identity in sorted(updated_ids)]
         send_telegram("🔄 تحديث في تفاصيل مباراة على تذكرتي:\n\n" + "\n\n".join(entries))
 
-    if removed:
-        entries = []
-        for key in sorted(removed):
-            info = prev_info.get(key)
-            if info:
-                entries.append(describe(info))
-        if entries:
-            send_telegram("⚪ لم تعد هذه المباراة ظاهرة كمتاحة للحجز:\n\n" + "\n\n".join(entries))
-        else:
-            send_telegram(f"⚪ تغيّرت قائمة المباريات المتاحة: اختفى {len(removed)} عنصر/عناصر من القائمة.")
+    # لا ترسل إشعار اختفاء متكررًا لنفس المباراة؛ يُعاد السماح به فقط بعد ظهورها مجددًا.
+    fresh_removed = [identity for identity in sorted(removed_ids) if identity not in removed_notified]
+    if fresh_removed:
+        entries = [describe(prev_by_identity[identity]) for identity in fresh_removed]
+        send_telegram("⚪ لم تعد هذه المباراة ظاهرة كمتاحة للحجز:\n\n" + "\n\n".join(entries))
+        for identity in fresh_removed:
+            removed_notified[identity] = now
+        log(f"تم إرسال إشعار اختفاء جديد لعدد {len(fresh_removed)} مباراة")
 
-    if not added and not removed and not updated:
+    # احتفظ بسجل محدود زمنيًا حتى لا يكبر ملف الحالة بلا نهاية.
+    cutoff = now - 30 * 24 * 3600
+    state["removed_notified"] = {
+        identity: stamp for identity, stamp in removed_notified.items()
+        if isinstance(stamp, (int, float)) and stamp >= cutoff
+    }
+
+    if not added_ids and not removed_ids and not updated_ids:
         log("لا يوجد تغيير في قائمة المباريات المتاحة؛ لن يتم إرسال رسالة.")
 
     state["avail"] = list(current)
