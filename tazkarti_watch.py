@@ -3,7 +3,7 @@
 - GitHub Actions: فحص واحد لكل تشغيل مجدول.
 - VPS: عند ضبط TARZKARTI_CONTINUOUS=1 يعمل باستمرار، افتراضيًا كل 60 ثانية.
 - يرسل Telegram عند تغيّر قائمة المباريات فقط، مع تقرير تأسيسي عند أول تشغيل.
-- يسجل تغيّر بصمات استجابات JSON من نطاق تذكرتي للمساعدة في اكتشاف إشارات مبكرة؛ لا يحفظ أجسام الاستجابات.
+- يقارن حقول واجهات JSON للمباريات والحجز، ويسجل التغييرات المهمة في ملف تاريخي دون حفظ أجسام الاستجابات كاملة.
 """
 import hashlib
 import json
@@ -59,6 +59,9 @@ API_STATE = {}
 # راقب واجهات بيانات المباريات والحجز فقط، وتجاهل ملفات اللغة والموارد الثابتة.
 WATCH_API_SUFFIXES = ("/data/matches-list-json.json", "/data/fanQueuesMatch-list-json.json")
 API_ALERT_COOLDOWN_SECONDS = 300  # منع تكرار التنبيه لنفس الواجهة أكثر من مرة كل 5 دقائق
+API_HISTORY_FILE = "tazkarti_api_history.jsonl"
+API_SNAPSHOT_MAX_BYTES = 200_000
+API_DIFF_MAX_FIELDS = 20
 
 JS_COLLECT = """
 ({book, bad}) => {
@@ -432,8 +435,54 @@ def save_api_state():
         log(f"ماقدرتش أحفظ سجل مراقبة API: {e}")
 
 
+def _short_value(value):
+    """قيمة مختصرة للعرض في سجل التغيير، دون تخزين جسم الاستجابة كاملًا."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value[:120] + ("…" if len(value) > 120 else "")
+    if isinstance(value, list):
+        return f"[قائمة: {len(value)} عنصر]"
+    if isinstance(value, dict):
+        keys = list(value.keys())[:8]
+        return "{حقول: " + ", ".join(str(k) for k in keys) + ("…" if len(value) > 8 else "") + "}"
+    return str(type(value).__name__)
+
+
+def _collect_json_changes(old_value, new_value, path="$", depth=0, output=None):
+    """مقارنة حقول JSON مع تجنب التوسع داخل القوائم الكبيرة."""
+    if output is None:
+        output = []
+    if len(output) >= API_DIFF_MAX_FIELDS:
+        return output
+    if isinstance(old_value, dict) and isinstance(new_value, dict) and depth < 5:
+        keys = sorted(set(old_value) | set(new_value), key=str)
+        for key in keys:
+            if len(output) >= API_DIFF_MAX_FIELDS:
+                break
+            child_path = f"{path}.{key}"
+            if key not in old_value:
+                output.append({"field": child_path, "old": "(غير موجود)", "new": _short_value(new_value[key])})
+            elif key not in new_value:
+                output.append({"field": child_path, "old": _short_value(old_value[key]), "new": "(تم حذفه)"})
+            else:
+                _collect_json_changes(old_value[key], new_value[key], child_path, depth + 1, output)
+        return output
+    if old_value != new_value:
+        output.append({"field": path, "old": _short_value(old_value), "new": _short_value(new_value)})
+    return output
+
+
+def _append_api_history(record):
+    try:
+        with open(API_HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as e:
+        log(f"ماقدرتش أضيف لسجل تغييرات API: {e}")
+
+
 def attach_api_observer(page):
-    """يراقب تغيّر واجهات بيانات المباريات/الحجز فقط، ويرسل تنبيهًا عند التغيير دون حفظ أجسام الاستجابات."""
+    """يراقب تغيّر حقول واجهات المباريات والحجز، ويسجل ملخصًا تاريخيًا ويرسل تنبيهًا عند التغيير."""
     def on_response(response):
         try:
             parsed = urllib.parse.urlsplit(response.url)
@@ -453,36 +502,90 @@ def attach_api_observer(page):
             if not body or len(body) > 2 * 1024 * 1024:
                 return
 
+            try:
+                payload = json.loads(body.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                log(f"[API_PARSE_ERROR] {endpoint} استجابة JSON غير قابلة للتحليل")
+                return
+
             now = int(time.time())
             digest = hashlib.sha256(body).hexdigest()[:20]
             old = API_STATE.get(endpoint)
-            status_changed = old is not None and old.get("status") != response.status
-            fingerprint_changed = old is not None and old.get("sha256") != digest
+            old = old if isinstance(old, dict) else {}
+            status_changed = bool(old) and old.get("status") != response.status
+            fingerprint_changed = bool(old) and old.get("sha256") != digest
+
+            # عند أول تشغيل للنسخة التي تحفظ التفاصيل، نأخذ خط أساس جديدًا دون تنبيه كاذب.
+            if old and "snapshot" not in old:
+                API_STATE[endpoint] = {
+                    "sha256": digest,
+                    "status": response.status,
+                    "last_seen": now,
+                    "last_alert": int(old.get("last_alert", 0)),
+                    "snapshot": payload if len(body) <= API_SNAPSHOT_MAX_BYTES else None,
+                }
+                log(f"[API_BASELINE_REFRESH] {endpoint} status={response.status} snapshot_saved={int(len(body) <= API_SNAPSHOT_MAX_BYTES)}")
+                return
+
+            changes = []
+            if old and "snapshot" in old and old.get("snapshot") is not None:
+                changes = _collect_json_changes(old["snapshot"], payload)
+
             entry = {
                 "sha256": digest,
                 "status": response.status,
                 "last_seen": now,
-                "last_alert": int((old or {}).get("last_alert", 0)),
+                "last_alert": int(old.get("last_alert", 0)),
+                "snapshot": payload if len(body) <= API_SNAPSHOT_MAX_BYTES else None,
             }
 
-            if old is None:
+            if not old:
                 log(f"[API_ENDPOINT] {endpoint} status={response.status} baseline=1")
+                _append_api_history({
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "event": "baseline",
+                    "endpoint": endpoint,
+                    "status": response.status,
+                })
             elif fingerprint_changed or status_changed:
+                stamp = datetime.now().isoformat(timespec="seconds")
                 log(
                     f"[API_CHANGE] {endpoint} status={response.status} "
                     f"fingerprint_changed={int(fingerprint_changed)} "
-                    f"status_changed={int(status_changed)}"
+                    f"status_changed={int(status_changed)} fields_changed={len(changes)}"
                 )
+                record = {
+                    "time": stamp,
+                    "event": "change",
+                    "endpoint": endpoint,
+                    "status": response.status,
+                    "status_changed": status_changed,
+                    "fingerprint_changed": fingerprint_changed,
+                    "fields": changes,
+                }
+                _append_api_history(record)
+
                 if now - entry["last_alert"] >= API_ALERT_COOLDOWN_SECONDS:
-                    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    send_telegram(
-                        "🔎 رصد تغيير في بيانات تذكرتي\\n"
-                        f"الواجهة: {parsed.path}\\n"
-                        f"HTTP: {response.status}\\n"
-                        f"الوقت: {stamp}\\n\\n"
-                        "قد يكون التغيير تحديثًا عاديًا أو إشارة مرتبطة بالمباريات/الحجز؛ "
-                        "ليس تأكيدًا لبدء البيع. راقب الموقع."
+                    lines = [
+                        "🔎 رصد تغيير في بيانات تذكرتي",
+                        f"الواجهة: {parsed.path}",
+                        f"HTTP: {response.status}",
+                        f"الوقت: {stamp}",
+                    ]
+                    if changes:
+                        lines.append("\nالحقول التي تغيّرت:")
+                        for item in changes[:10]:
+                            lines.append(
+                                f"• {item['field']}: "
+                                f"{item['old']} ← {item['new']}"
+                            )
+                    else:
+                        lines.append("\nتغيرت بصمة الاستجابة، لكن لم يتوفر فرق حقول قابل للعرض.")
+                    lines.append(
+                        "\nقد يكون التغيير تحديثًا عاديًا أو إشارة مرتبطة بالمباريات/الحجز؛ "
+                        "ليس تأكيدًا لبدء البيع."
                     )
+                    send_telegram("\n".join(lines))
                     entry["last_alert"] = now
                     log(f"[API_ALERT_SENT] {endpoint}")
                 else:
