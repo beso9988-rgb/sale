@@ -556,7 +556,7 @@ def _record_api_discovery(record):
     """يسجل فقط بيانات تعريف الواجهة وبنية JSON؛ لا يسجل query string أو body."""
     try:
         with open(API_DISCOVERY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\\n")
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as e:
         log(f"ماقدرتش أسجل واجهة API المكتشفة: {e}")
 
