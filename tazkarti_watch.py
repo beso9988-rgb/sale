@@ -609,6 +609,27 @@ def attach_api_discovery(page):
             except Exception:
                 pass
 
+            # سجل كل استدعاء لواجهة /rb/ ببيانات وصفية فقط، دون حفظ الطلب أو الاستجابة.
+            if parsed.path.startswith("/rb/"):
+                rb_record = {
+                    "time": datetime.now().isoformat(timespec="seconds"),
+                    "endpoint": endpoint,
+                    "method": response.request.method,
+                    "status": response.status,
+                    "content_type": content_type.split(";")[0][:80],
+                    "response_bytes": len(body) if body else None,
+                    "body_available": bool(body),
+                }
+                try:
+                    rb_file = "tazkarti_rb_calls.jsonl"
+                    if os.path.exists(rb_file) and os.path.getsize(rb_file) > 5 * 1024 * 1024:
+                        os.replace(rb_file, rb_file + ".1")
+                    with open(rb_file, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(rb_record, ensure_ascii=False) + "\\n")
+                    log(f"[RB_CALL] {parsed.path} method={response.request.method} status={response.status} bytes={rb_record['response_bytes']}")
+                except Exception as e:
+                    log(f"[RB_CALL_LOG_ERROR] {e}")
+
             if not digest:
                 return
 
