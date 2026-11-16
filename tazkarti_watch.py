@@ -62,6 +62,8 @@ API_ALERT_COOLDOWN_SECONDS = 300  # منع تكرار التنبيه لنفس ا
 API_HISTORY_FILE = "tazkarti_api_history.jsonl"
 API_SNAPSHOT_MAX_BYTES = 200_000
 API_DIFF_MAX_FIELDS = 20
+API_DISCOVERY_FILE = "tazkarti_api_discovery.jsonl"
+API_DISCOVERY_MAX_ENDPOINTS = 500
 
 JS_COLLECT = """
 ({book, bad}) => {
@@ -534,6 +536,88 @@ def _append_api_history(record):
         log(f"ماقدرتش أضيف لسجل تغييرات API: {e}")
 
 
+
+def _api_shape(value):
+    """ملخص آمن لبنية JSON دون حفظ القيم أو البيانات الشخصية."""
+    if isinstance(value, dict):
+        return {"type": "object", "keys": sorted(str(k) for k in value.keys())[:80]}
+    if isinstance(value, list):
+        sample = value[0] if value else None
+        return {
+            "type": "array",
+            "length": len(value),
+            "item_type": type(sample).__name__ if sample is not None else "empty",
+            "item_keys": sorted(str(k) for k in sample.keys())[:80] if isinstance(sample, dict) else [],
+        }
+    return {"type": type(value).__name__}
+
+
+def _record_api_discovery(record):
+    """يسجل فقط بيانات تعريف الواجهة وبنية JSON؛ لا يسجل query string أو body."""
+    try:
+        with open(API_DISCOVERY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\\n")
+    except Exception as e:
+        log(f"ماقدرتش أسجل واجهة API المكتشفة: {e}")
+
+
+def attach_api_discovery(page):
+    """اكتشاف واجهات JSON/XHR على نطاق تذكرتي دون حفظ محتوى الاستجابات."""
+    seen = set()
+    try:
+        with open(API_DISCOVERY_FILE, encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    seen.add(item.get("endpoint", ""))
+                except Exception:
+                    continue
+    except FileNotFoundError:
+        pass
+
+    def on_response(response):
+        try:
+            parsed = urllib.parse.urlsplit(response.url)
+            host = (parsed.hostname or "").lower()
+            if host != "tazkarti.com" and not host.endswith(".tazkarti.com"):
+                return
+            content_type = response.headers.get("content-type", "").lower()
+            resource_type = response.request.resource_type
+            if "json" not in content_type and resource_type not in ("xhr", "fetch"):
+                return
+            # لا نسجل query string أو fragment لتجنب أي رموز/معرفات حساسة.
+            endpoint = f"{host}{parsed.path}"
+            if endpoint in seen:
+                return
+            body = b""
+            shape = {"type": "unavailable"}
+            if "json" in content_type:
+                try:
+                    body = response.body()
+                    if body and len(body) <= 2 * 1024 * 1024:
+                        payload = json.loads(body.decode("utf-8-sig"))
+                        shape = _api_shape(payload)
+                except Exception:
+                    shape = {"type": "json_unparsed"}
+            record = {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "endpoint": endpoint,
+                "method": response.request.method,
+                "resource_type": resource_type,
+                "status": response.status,
+                "content_type": content_type.split(";")[0][:80],
+                "response_bytes": len(body) if body else None,
+                "json_shape": shape,
+            }
+            _record_api_discovery(record)
+            seen.add(endpoint)
+            log(f"[API_DISCOVERY] {endpoint} status={response.status} type={resource_type} shape={shape.get('type')}")
+        except Exception as e:
+            log(f"[API_DISCOVERY_ERROR] {e}")
+
+    page.on("response", on_response)
+
+
 def attach_api_observer(page):
     """يراقب تغيّر حقول واجهات المباريات والحجز، ويسجل ملخصًا تاريخيًا ويرسل تنبيهًا عند التغيير."""
     def on_response(response):
@@ -667,6 +751,7 @@ def main():
             ),
         )
         page = context.new_page()
+        attach_api_discovery(page)
         attach_api_observer(page)
 
         if GITHUB_ACTIONS or os.getenv("TARZKARTI_RUN_ONCE", "0") == "1":
