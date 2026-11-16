@@ -564,6 +564,7 @@ def _record_api_discovery(record):
 def attach_api_discovery(page):
     """اكتشاف واجهات XHR/Fetch ورصد تغير بصمة الاستجابة دون حفظ محتواها."""
     seen = {}
+    last_alert = {}
     try:
         with open(API_DISCOVERY_FILE, encoding="utf-8") as f:
             for line in f:
@@ -573,6 +574,8 @@ def attach_api_discovery(page):
                     digest = item.get("sha256")
                     if endpoint and digest:
                         seen[endpoint] = digest
+                        if item.get("last_alert"):
+                            last_alert[endpoint] = int(item["last_alert"])
                 except Exception:
                     continue
     except FileNotFoundError:
@@ -626,10 +629,30 @@ def attach_api_discovery(page):
                 "sha256": digest,
                 "json_shape": shape,
             }
+            # تجاهل موارد الترجمة والملفات الثابتة عند التنبيه؛ نحتفظ باكتشافها في السجل فقط.
+            is_known_list = any(parsed.path.endswith(suffix) for suffix in WATCH_API_SUFFIXES)
+            is_translation = "/assets/i18n/" in parsed.path
+            alert_candidate = event == "changed" and not is_known_list and not is_translation
+            last_sent = int(last_alert.get(endpoint, 0))
+            if alert_candidate and time.time() - last_sent >= API_ALERT_COOLDOWN_SECONDS:
+                record["last_alert"] = int(time.time())
+                last_alert[endpoint] = record["last_alert"]
+
             _record_api_discovery(record)
             seen[endpoint] = digest
             if event == "changed":
                 log(f"[API_DISCOVERY_CHANGE] {endpoint} status={response.status} bytes={len(body)} shape={shape.get('type')}")
+                if alert_candidate and record.get("last_alert"):
+                    notice = (
+                        "🧭 إشارة API جديدة محتملة قبل/أثناء تحديث تذكرتي\\n"
+                        f"المسار: {parsed.path}\\n"
+                        f"الطريقة: {response.request.method} | HTTP: {response.status}\\n"
+                        f"نوع البيانات: {content_type.split(';')[0][:80]} | الحجم: {len(body)} بايت\\n"
+                        f"البنية: {shape.get('type')} | الوقت: {record['time']}\\n\\n"
+                        "ده رصد لتغيّر في واجهة غير قائمة المباريات، وليس تأكيدًا لبدء البيع."
+                    )
+                    send_telegram(notice)
+                    log(f"[API_DISCOVERY_ALERT] {endpoint}")
             else:
                 log(f"[API_DISCOVERY] {endpoint} status={response.status} type={resource_type} shape={shape.get('type')}")
         except Exception as e:
