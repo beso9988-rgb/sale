@@ -562,14 +562,17 @@ def _record_api_discovery(record):
 
 
 def attach_api_discovery(page):
-    """اكتشاف واجهات JSON/XHR على نطاق تذكرتي دون حفظ محتوى الاستجابات."""
-    seen = set()
+    """اكتشاف واجهات XHR/Fetch ورصد تغير بصمة الاستجابة دون حفظ محتواها."""
+    seen = {}
     try:
         with open(API_DISCOVERY_FILE, encoding="utf-8") as f:
             for line in f:
                 try:
                     item = json.loads(line)
-                    seen.add(item.get("endpoint", ""))
+                    endpoint = item.get("endpoint", "")
+                    digest = item.get("sha256")
+                    if endpoint and digest:
+                        seen[endpoint] = digest
                 except Exception:
                     continue
     except FileNotFoundError:
@@ -585,33 +588,50 @@ def attach_api_discovery(page):
             resource_type = response.request.resource_type
             if "json" not in content_type and resource_type not in ("xhr", "fetch"):
                 return
-            # لا نسجل query string أو fragment لتجنب أي رموز/معرفات حساسة.
+
             endpoint = f"{host}{parsed.path}"
-            if endpoint in seen:
-                return
             body = b""
+            digest = None
             shape = {"type": "unavailable"}
-            if "json" in content_type:
-                try:
-                    body = response.body()
-                    if body and len(body) <= 2 * 1024 * 1024:
-                        payload = json.loads(body.decode("utf-8-sig"))
-                        shape = _api_shape(payload)
-                except Exception:
-                    shape = {"type": "json_unparsed"}
+            try:
+                body = response.body()
+                if body:
+                    digest = hashlib.sha256(body).hexdigest()[:20]
+                    if "json" in content_type and len(body) <= 2 * 1024 * 1024:
+                        try:
+                            payload = json.loads(body.decode("utf-8-sig"))
+                            shape = _api_shape(payload)
+                        except Exception:
+                            shape = {"type": "json_unparsed"}
+            except Exception:
+                pass
+
+            if not digest:
+                return
+
+            previous = seen.get(endpoint)
+            event = "baseline" if previous is None else ("changed" if previous != digest else None)
+            if event is None:
+                return
+
             record = {
                 "time": datetime.now().isoformat(timespec="seconds"),
+                "event": event,
                 "endpoint": endpoint,
                 "method": response.request.method,
                 "resource_type": resource_type,
                 "status": response.status,
                 "content_type": content_type.split(";")[0][:80],
-                "response_bytes": len(body) if body else None,
+                "response_bytes": len(body) if body else 0,
+                "sha256": digest,
                 "json_shape": shape,
             }
             _record_api_discovery(record)
-            seen.add(endpoint)
-            log(f"[API_DISCOVERY] {endpoint} status={response.status} type={resource_type} shape={shape.get('type')}")
+            seen[endpoint] = digest
+            if event == "changed":
+                log(f"[API_DISCOVERY_CHANGE] {endpoint} status={response.status} bytes={len(body)} shape={shape.get('type')}")
+            else:
+                log(f"[API_DISCOVERY] {endpoint} status={response.status} type={resource_type} shape={shape.get('type')}")
         except Exception as e:
             log(f"[API_DISCOVERY_ERROR] {e}")
 
