@@ -679,6 +679,28 @@ def attach_api_discovery(page):
         except Exception as e:
             log(f"[API_DISCOVERY_ERROR] {e}")
 
+    def on_request(request):
+        try:
+            parsed = urllib.parse.urlsplit(request.url)
+            host = (parsed.hostname or "").lower()
+            if (host != "tazkarti.com" and not host.endswith(".tazkarti.com")) or not parsed.path.startswith("/rb/"):
+                return
+            record = {
+                "time": datetime.now().isoformat(timespec="seconds"),
+                "endpoint": f"{host}{parsed.path}",
+                "method": request.method,
+                "resource_type": request.resource_type,
+            }
+            request_file = "tazkarti_rb_requests.jsonl"
+            if os.path.exists(request_file) and os.path.getsize(request_file) > 5 * 1024 * 1024:
+                os.replace(request_file, request_file + ".1")
+            with open(request_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\\n")
+            log(f"[RB_REQUEST] {parsed.path} method={request.method} type={request.resource_type}")
+        except Exception as e:
+            log(f"[RB_REQUEST_LOG_ERROR] {e}")
+
+    page.on("request", on_request)
     page.on("response", on_response)
 
 
