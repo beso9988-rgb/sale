@@ -75,11 +75,14 @@ class Handler(BaseHTTPRequestHandler):
         if length < 1 or length > MAX_BODY:
             self.reply(413, "invalid body size")
             return
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        lines = raw.splitlines()
-        package = lines[0].strip() if lines else ""
-        title = lines[1].strip() if len(lines) > 1 else ""
-        body = "\n".join(lines[2:]).strip() if len(lines) > 2 else ""
+        raw = self.rfile.read(length).decode("utf-8", errors="replace").strip()
+        # MacroDroid sends three fields separated by pipes; split only twice
+        # so any pipe characters inside the notification text are preserved.
+        parts = raw.split("|", 2)
+        if len(parts) != 3:
+            self.reply(400, "expected package|title|text")
+            return
+        package, title, body = (part.strip() for part in parts)
         if package != EXPECTED_PACKAGE:
             self.reply(403, "unexpected app package")
             return
