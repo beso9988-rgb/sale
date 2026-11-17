@@ -82,12 +82,16 @@ def main():
                     stamp = event.get("time")
                     received = datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M:%S") if isinstance(stamp, (int, float)) else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                     text = "🔔 إشعار من تطبيق Tazkarti Plus\\n" + message + f"\\n\\nوقت الاستقبال: {received}"
-                    try:
-                        send_telegram(text)
-                        log(f"Forwarded Tazkarti Plus notification (id={message_id or 'none'}).")
-                    except Exception as exc:
-                        log(f"Telegram forwarding failed: {type(exc).__name__}")
-                        continue
+                    for attempt in range(3):
+                        try:
+                            send_telegram(text)
+                            log(f"Forwarded Tazkarti Plus notification (id={message_id or 'none'}).")
+                            break
+                        except Exception as exc:
+                            log(f"Telegram forwarding attempt {attempt + 1}/3 failed: {type(exc).__name__}")
+                            if attempt == 2:
+                                raise
+                            time.sleep(2)
                     if message_id:
                         seen.append(message_id)
                         seen = seen[-MAX_SEEN:]
