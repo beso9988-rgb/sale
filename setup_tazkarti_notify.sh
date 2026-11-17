@@ -99,7 +99,7 @@ echo "=== Caddy status ==="
 sudo systemctl --no-pager --full status caddy | sed -n '1,12p'
 echo
 echo "=== MacroDroid endpoint ==="
-echo "https://\${DOMAIN}/notify"
+echo "https://${DOMAIN}/notify"
 echo
 echo "=== COPY THIS TOKEN INTO MACRODROID HEADER; DO NOT SHARE IT ==="
 echo "$TOKEN"
