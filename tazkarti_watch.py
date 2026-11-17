@@ -683,22 +683,30 @@ def attach_api_discovery(page):
         try:
             parsed = urllib.parse.urlsplit(request.url)
             host = (parsed.hostname or "").lower()
-            if (host != "tazkarti.com" and not host.endswith(".tazkarti.com")) or not parsed.path.startswith("/rb/"):
+            if host != "tazkarti.com" and not host.endswith(".tazkarti.com"):
                 return
+            if request.resource_type not in ("xhr", "fetch"):
+                return
+
+            # نسجل المسار فقط؛ لا نسجل query string أو headers أو body.
             record = {
                 "time": datetime.now().isoformat(timespec="seconds"),
                 "endpoint": f"{host}{parsed.path}",
                 "method": request.method,
                 "resource_type": request.resource_type,
             }
-            request_file = "tazkarti_rb_requests.jsonl"
-            if os.path.exists(request_file) and os.path.getsize(request_file) > 5 * 1024 * 1024:
+            request_file = "tazkarti_network_requests.jsonl"
+            if os.path.exists(request_file) and os.path.getsize(request_file) > 10 * 1024 * 1024:
                 os.replace(request_file, request_file + ".1")
             with open(request_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(record, ensure_ascii=False) + "\\n")
-            log(f"[RB_REQUEST] {parsed.path} method={request.method} type={request.resource_type}")
+
+            if parsed.path.startswith("/rb/"):
+                log(f"[RB_REQUEST] {parsed.path} method={request.method} type={request.resource_type}")
+            else:
+                log(f"[API_REQUEST] {parsed.path} method={request.method} type={request.resource_type}")
         except Exception as e:
-            log(f"[RB_REQUEST_LOG_ERROR] {e}")
+            log(f"[API_REQUEST_LOG_ERROR] {e}")
 
     page.on("request", on_request)
     page.on("response", on_response)
