@@ -77,7 +77,7 @@ if [[ -f /etc/caddy/Caddyfile ]]; then
   sudo cp -n /etc/caddy/Caddyfile /etc/caddy/Caddyfile.before-tazkarti-notify
 fi
 sudo tee /etc/caddy/Caddyfile >/dev/null <<CADDY
-\${DOMAIN} {
+${DOMAIN} {
     reverse_proxy 127.0.0.1:8765
 }
 CADDY
