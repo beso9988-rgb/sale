@@ -589,7 +589,7 @@ def attach_api_discovery(page):
                 return
             content_type = response.headers.get("content-type", "").lower()
             resource_type = response.request.resource_type
-            if "json" not in content_type and resource_type not in ("xhr", "fetch"):
+            if "json" not in content_type and resource_type not in ("xhr", "fetch", "document"):
                 return
 
             endpoint = f"{host}{parsed.path}"
@@ -610,7 +610,7 @@ def attach_api_discovery(page):
                 pass
 
             # سجل كل استدعاء لواجهة /rb/ ببيانات وصفية فقط، دون حفظ الطلب أو الاستجابة.
-            if parsed.path.startswith("/rb/"):
+            if parsed.path.startswith(("/rb/", "/rb_/")):
                 rb_record = {
                     "time": datetime.now().isoformat(timespec="seconds"),
                     "endpoint": endpoint,
@@ -653,7 +653,7 @@ def attach_api_discovery(page):
             # تجاهل موارد الترجمة والملفات الثابتة عند التنبيه؛ نحتفظ باكتشافها في السجل فقط.
             is_known_list = any(parsed.path.endswith(suffix) for suffix in WATCH_API_SUFFIXES)
             is_translation = "/assets/i18n/" in parsed.path
-            alert_candidate = event == "changed" and not is_known_list and not is_translation
+            alert_candidate = event in ("baseline", "changed") and not is_known_list and not is_translation
             last_sent = int(last_alert.get(endpoint, 0))
             if alert_candidate and time.time() - last_sent >= API_ALERT_COOLDOWN_SECONDS:
                 record["last_alert"] = int(time.time())
@@ -663,19 +663,22 @@ def attach_api_discovery(page):
             seen[endpoint] = digest
             if event == "changed":
                 log(f"[API_DISCOVERY_CHANGE] {endpoint} status={response.status} bytes={len(body)} shape={shape.get('type')}")
-                if alert_candidate and record.get("last_alert"):
-                    notice = (
-                        "🧭 إشارة API جديدة محتملة قبل/أثناء تحديث تذكرتي\\n"
-                        f"المسار: {parsed.path}\\n"
-                        f"الطريقة: {response.request.method} | HTTP: {response.status}\\n"
-                        f"نوع البيانات: {content_type.split(';')[0][:80]} | الحجم: {len(body)} بايت\\n"
-                        f"البنية: {shape.get('type')} | الوقت: {record['time']}\\n\\n"
-                        "ده رصد لتغيّر في واجهة غير قائمة المباريات، وليس تأكيدًا لبدء البيع."
-                    )
-                    send_telegram(notice)
-                    log(f"[API_DISCOVERY_ALERT] {endpoint}")
+                event_label = "تغيّر في استجابة واجهة موجودة"
             else:
                 log(f"[API_DISCOVERY] {endpoint} status={response.status} type={resource_type} shape={shape.get('type')}")
+                event_label = "اكتشاف واجهة جديدة على الموقع"
+
+            if alert_candidate and record.get("last_alert"):
+                notice = (
+                    f"🧭 {event_label} في تذكرتي\\n"
+                    f"المسار: {parsed.path}\\n"
+                    f"الطريقة: {response.request.method} | HTTP: {response.status}\\n"
+                    f"نوع البيانات: {content_type.split(';')[0][:80]} | الحجم: {len(body)} بايت\\n"
+                    f"نوع المورد: {resource_type} | الوقت: {record['time']}\\n\\n"
+                    "ده رصد لتغيير ظاهر للمتصفح، وليس تأكيدًا لبدء بيع التذاكر."
+                )
+                send_telegram(notice)
+                log(f"[API_DISCOVERY_ALERT] {endpoint}")
         except Exception as e:
             log(f"[API_DISCOVERY_ERROR] {e}")
 
