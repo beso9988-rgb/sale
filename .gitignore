@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.env
+*.env
+seen*.json
+tazkarti_*state*.json
+*tazkarti*storage*.json
+*session*.json
+tazkarti_telegram_outbox.json
+tazkarti_api_watch.json
+tazkarti_api_*.jsonl
+*.log
