@@ -1,9 +1,6 @@
-"""
-مراقب تذكرتي.
-- GitHub Actions: فحص واحد لكل تشغيل مجدول.
-- VPS: عند ضبط TARZKARTI_CONTINUOUS=1 يعمل باستمرار، افتراضيًا كل 60 ثانية.
-- يرسل Telegram عند تغيّر قائمة المباريات فقط، مع تقرير تأسيسي عند أول تشغيل.
-- يقارن حقول واجهات JSON للمباريات والحجز، ويسجل التغييرات المهمة في ملف تاريخي دون حفظ أجسام الاستجابات كاملة.
+"""Public-list and known-feed change signals, not confirmed ticket inventory.
+Default cadence is 60 seconds. Sub-minute operation requires an explicit risk gate.
+See README.md for deployment limits, stop behavior and offline test coverage.
 """
 import hashlib
 import json
@@ -14,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from monitor_runtime import atomic_json, poll_seconds, cycle_delay, DurableOutbox
 
 from playwright.sync_api import sync_playwright
 
@@ -34,9 +32,9 @@ TEAMS_FILTER = [
 
 # على VPS اضبط TARZKARTI_POLL_SECONDS=60 لمراقبة كل دقيقة.
 # ابدأ بفاصل 60 ثانية لتقليل الضغط على الموقع؛ لا توجد ضمانة بتنبيه قبل نزول التذاكر.
-POLL_INTERVAL_SECONDS = max(30, int(os.getenv("TARZKARTI_POLL_SECONDS", "60")))
+POLL_INTERVAL_SECONDS = poll_seconds(os.environ)
 HEADLESS = os.getenv("TARZKARTI_HEADLESS", "1").strip() == "1"
-SAVE_DEBUG = True
+SAVE_DEBUG = os.getenv("TARZKARTI_SAVE_DEBUG", "0") == "1"
 RENOTIFY_AFTER_HOURS = 1
 # ===================================
 
@@ -132,7 +130,7 @@ JS_COLLECT = """
 NAV_NOISE = re.compile(r"\bfaq\b|about tazkarti|our stores|stadium locations|الأسئلة الشائعة", re.I)
 
 BLOCK_WORDS = ["captcha", "just a moment", "attention required", "access denied",
-               "verify you are human", "not a robot", "forbidden"]
+               "verify you are human", "not a robot", "forbidden", "checking your browser", "too many requests"]
 
 
 def log(msg):
@@ -140,31 +138,17 @@ def log(msg):
 
 
 def send_telegram(text):
-    """يرسل الرسالة على أجزاء عند الحاجة، مع مراعاة حد تليجرام."""
-    if not BOT_TOKEN or not CHAT_ID:
-        log("لم يتم الإرسال: أضف TELEGRAM_BOT_TOKEN و TELEGRAM_CHAT_ID في Secrets/Environment.")
-        return
-
-    api = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    # Persist first; a failed Telegram send must not consume a detected change.
+    outbox = get_outbox()
     remaining = str(text)
-    chunks = []
     while remaining:
-        if len(remaining) <= 3800:
-            chunks.append(remaining)
-            break
-        cut = remaining.rfind("\n", 0, 3800)
-        if cut < 1000:
-            cut = 3800
-        chunks.append(remaining[:cut])
+        cut = min(3500, len(remaining))
+        if cut < len(remaining):
+            split = remaining.rfind("\n", 0, cut)
+            if split > 1000:
+                cut = split
+        outbox.enqueue(remaining[:cut])
         remaining = remaining[cut:].lstrip("\n")
-
-    for chunk in chunks:
-        data = urllib.parse.urlencode({"chat_id": CHAT_ID, "text": chunk}).encode()
-        try:
-            with urllib.request.urlopen(api, data=data, timeout=20) as response:
-                response.read()
-        except Exception as e:
-            log(f"فشل إرسال تليجرام: {e}")
 
 
 def load_state():
@@ -185,11 +169,7 @@ def load_state():
 
 
 def save_state(st):
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(st, f, ensure_ascii=False)
-    except Exception as e:
-        log(f"ماقدرتش أحفظ الحالة: {e}")
+    atomic_json(STATE_FILE, st)
 
 
 def clean_lines(text):
@@ -211,19 +191,21 @@ def make_key(lines, href):
 
 
 def scan(page, url, first_run):
-    """بيرجّع (الحالة, {key: info}). الحالة: OK / BLOCKED / EMPTY"""
-    page.goto("about:blank")                      # عشان الصفحات اللي بتتغير بالـ # تتحمل من جديد
-    page.goto(url, wait_until="domcontentloaded", timeout=60000)
-    try:
-        page.wait_for_load_state("networkidle", timeout=20000)
-    except Exception:
-        pass
-    page.wait_for_timeout(6000)
-
+    # A hash-only navigation needs a real reload; reuse the browser/context.
+    if page.url == url:
+        page.reload(wait_until="domcontentloaded", timeout=30000)
+    else:
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_function("""() => {
+      const text = document.body?.innerText || '';
+      return /book ticket|احجز|sold out|نفدت|no matches|لا توجد مباريات|captcha|access denied|just a moment|checking your browser|verify you are human|too many requests|attention required/i.test(text);
+    }""", timeout=15000)
+    if getattr(page, '_monitor_halt', None):
+        return "BLOCKED", {}
     title = (page.title() or "").lower()
     body = page.inner_text("body")
 
-    if len(body) < 2500 and any(w in f"{title} {body.lower()}" for w in BLOCK_WORDS):
+    if any(w in f"{title} {body.lower()}" for w in BLOCK_WORDS):
         return "BLOCKED", {}
 
     cands = page.evaluate(JS_COLLECT, {"book": BOOK_RE, "bad": UNAVAILABLE_RE})
@@ -261,6 +243,8 @@ def scan(page, url, first_run):
         found[make_key(c["teams"] + lines, href)] = {
             "lines": lines[:8], "teams": c["teams"][:2], "href": href, "idx": c["idx"], "url": url,
         }
+    if not cands and not re.search(r"no matches|لا توجد مباريات", body, re.I):
+        return "UNKNOWN", {}
     return ("OK" if found else "EMPTY"), found
 
 
@@ -298,7 +282,7 @@ def send_availability_report(current):
     if not current:
         send_telegram(
             f"🎟️ تقرير تذكرتي | {stamp}\n\n"
-            "لا توجد مباريات متاحة للحجز حاليًا."
+            "لم تظهر إشارات حجز في قائمة المباريات العامة. هذا لا يؤكد حالة التذاكر داخل الحساب."
         )
         return
 
@@ -312,7 +296,7 @@ def send_availability_report(current):
 
     report = (
         f"🎟️ تقرير تذكرتي | {stamp}\n"
-        f"عدد المباريات المتاحة: {len(entries)}\n\n"
+        f"عدد إشارات قائمة المباريات: {len(entries)}\n\n"
         + "\n\n".join(entries)
     )
     send_telegram(report)
@@ -348,27 +332,24 @@ def resolve_link(page, info):
 
 def process(page, state, first_run):
     now = time.time()
-    current, blocked, healthy = {}, False, False
+    current = {}
+    state['cycle_ok'] = False
     for url in PAGES:
         try:
             status, found = scan(page, url, first_run)
-        except Exception as e:
-            log(f"خطأ في {url}: {e}")
-            continue
-        log(f"{url} -> {status} ({len(found)} متاح)")
-        if status == "BLOCKED":
-            blocked = True
-            continue
-        healthy = True
+        except Exception as exc:
+            log(f"Scan failed: {type(exc).__name__}; preserving baseline")
+            if getattr(page, '_monitor_halt', None):
+                state['halt_reason'] = page._monitor_halt
+            return
+        log(f"Scan status={status}, listing signals={len(found)}")
+        if status == 'BLOCKED':
+            state['halt_reason'] = getattr(page, '_monitor_halt', None) or 'challenge_or_block'
+            return
+        if status not in ('OK', 'EMPTY'):
+            return
         current.update(found)
-        time.sleep(random.uniform(3, 6))
-
-    if blocked and now - state["last_block_alert"] > 6 * 3600:
-        state["last_block_alert"] = now
-        send_telegram("⚠️ موقع تذكرتي طلب تحقق أو حجب الفحص. أوقفت تغييرات الحالة لتجنب تنبيهات غير صحيحة.")
-
-    if not healthy:
-        return
+    state['cycle_ok'] = True
 
     prev_keys = set(state.get("avail", []))
     prev_info = state.get("avail_info", {}) or {}
@@ -416,7 +397,7 @@ def process(page, state, first_run):
             link = info.get("href") or info.get("url", "")
             entries.append(f"{number}) {describe(info)}" + (f"\n🔗 {link}" if link else ""))
         send_telegram(
-            "🟢 تغيير في تذكرتي: ظهرت مباراة/مباريات متاحة جديدة\n\n"
+            "🟢 تغيير في تذكرتي: ظهرت إشارة حجز جديدة في القائمة العامة، وليست تأكيدًا لتوفر تذاكر\n\n"
             + "\n\n".join(entries)
         )
         for identity in added_ids:
@@ -430,7 +411,7 @@ def process(page, state, first_run):
     fresh_removed = [identity for identity in sorted(removed_ids) if identity not in removed_notified]
     if fresh_removed:
         entries = [describe(prev_by_identity[identity]) for identity in fresh_removed]
-        send_telegram("⚪ لم تعد هذه المباراة ظاهرة كمتاحة للحجز:\n\n" + "\n\n".join(entries))
+        send_telegram("⚪ اختفت إشارة هذه المباراة من القائمة العامة:\n\n" + "\n\n".join(entries))
         for identity in fresh_removed:
             removed_notified[identity] = now
         log(f"تم إرسال إشعار اختفاء جديد لعدد {len(fresh_removed)} مباراة")
@@ -471,11 +452,7 @@ def load_api_state():
 
 
 def save_api_state():
-    try:
-        with open(API_STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(API_STATE, f, ensure_ascii=False)
-    except Exception as e:
-        log(f"ماقدرتش أحفظ سجل مراقبة API: {e}")
+    atomic_json(API_STATE_FILE, API_STATE)
 
 
 def _short_value(value):
@@ -743,7 +720,7 @@ def attach_api_observer(page):
                 return
 
             now = int(time.time())
-            digest = hashlib.sha256(body).hexdigest()[:20]
+            digest = hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:20]
             old = API_STATE.get(endpoint)
             old = old if isinstance(old, dict) else {}
             status_changed = bool(old) and old.get("status") != response.status
@@ -799,31 +776,28 @@ def attach_api_observer(page):
                 }
                 _append_api_history(record)
 
-                if now - entry["last_alert"] >= API_ALERT_COOLDOWN_SECONDS:
-                    lines = [
-                        "🔎 رصد تغيير في بيانات تذكرتي",
-                        f"الواجهة: {parsed.path}",
-                        f"HTTP: {response.status}",
-                        f"الوقت: {stamp}",
-                    ]
-                    if changes:
-                        lines.append("\nالحقول التي تغيّرت:")
-                        for item in changes[:10]:
-                            lines.append(
-                                f"• {item['field']}: "
-                                f"{item['old']} ← {item['new']}"
-                            )
-                    else:
-                        lines.append("\nتغيرت بصمة الاستجابة، لكن لم يتوفر فرق حقول قابل للعرض.")
-                    lines.append(
-                        "\nقد يكون التغيير تحديثًا عاديًا أو إشارة مرتبطة بالمباريات/الحجز؛ "
-                        "ليس تأكيدًا لبدء البيع."
-                    )
-                    send_telegram("\n".join(lines))
-                    entry["last_alert"] = now
-                    log(f"[API_ALERT_SENT] {endpoint}")
+                lines = [
+                    "🔎 رصد تغيير في بيانات تذكرتي",
+                    f"الواجهة: {parsed.path}",
+                    f"HTTP: {response.status}",
+                    f"الوقت: {stamp}",
+                ]
+                if changes:
+                    lines.append("\nالحقول التي تغيّرت:")
+                    for item in changes[:10]:
+                        lines.append(
+                            f"• {item['field']}: "
+                            f"{item['old']} ← {item['new']}"
+                        )
                 else:
-                    log(f"[API_ALERT_COOLDOWN] {endpoint} alert suppressed")
+                    lines.append("\nتغيرت بصمة الاستجابة، لكن لم يتوفر فرق حقول قابل للعرض.")
+                lines.append(
+                    "\nقد يكون التغيير تحديثًا عاديًا أو إشارة مرتبطة بالمباريات/الحجز؛ "
+                    "ليس تأكيدًا لبدء البيع."
+                )
+                send_telegram("\n".join(lines))
+                entry["last_alert"] = now
+                log(f"[API_ALERT_SENT] {endpoint}")
 
             API_STATE[endpoint] = entry
         except Exception as e:
@@ -836,42 +810,87 @@ def attach_api_observer(page):
 def main():
     global API_STATE
     state = load_state()
+    if state.get('halt_reason'):
+        flush_telegram()
+        log('Monitor is halted. Resolve the block before removing halt_reason from state.')
+        raise SystemExit(78)
     API_STATE = load_api_state()
     with sync_playwright() as p:
         browser = launch(p)
-        context = browser.new_context(
-            locale="ar-EG",
-            viewport={"width": 1280, "height": 900},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
-            ),
-        )
+        options = dict(locale='ar-EG', viewport={'width': 1280, 'height': 900})
+        session_file = os.getenv('TARZKARTI_STORAGE_STATE')
+        if session_file:
+            options['storage_state'] = session_file
+        context = browser.new_context(**options)
         page = context.new_page()
-        attach_api_discovery(page)
+        def guard(response):
+            parsed = urllib.parse.urlsplit(response.url)
+            host = (parsed.hostname or '').lower()
+            relevant = response.request.resource_type in ('document', 'xhr', 'fetch')
+            if relevant and (host == 'tazkarti.com' or host.endswith('.tazkarti.com')) and response.status in (401, 403, 429):
+                page._monitor_halt = f'http_{response.status}'
+        page.on('response', guard)
         attach_api_observer(page)
-
-        if GITHUB_ACTIONS or os.getenv("TARZKARTI_RUN_ONCE", "0") == "1":
-            try:
-                process(page, state, first_run=not state["baseline_done"])
-            finally:
+        # Discovery is diagnostic only, not an early-ticket predictor.
+        if os.getenv('TARZKARTI_API_DISCOVERY') == '1':
+            attach_api_discovery(page)
+        failures = 0
+        one_shot = GITHUB_ACTIONS or os.getenv('TARZKARTI_RUN_ONCE', '0') == '1'
+        try:
+            while True:
+                started = time.monotonic()
+                try:
+                    process(page, state, first_run=not state['baseline_done'])
+                except Exception as exc:
+                    state['cycle_ok'] = False
+                    log(f'Cycle error: {type(exc).__name__}')
+                if getattr(page, '_monitor_halt', None):
+                    state['halt_reason'] = page._monitor_halt
+                if state.get('halt_reason') and not state.get('halt_notified'):
+                    send_telegram('⚠️ توقفت مراقبة تذكرتي بسبب حظر أو تحقق أو انتهاء الجلسة. لا توجد إعادة محاولة تلقائية؛ افحص السبب قبل إعادة التشغيل.')
+                    state['halt_notified'] = True
                 save_state(state)
                 save_api_state()
-                browser.close()
-            return
+                flush_telegram()
+                if state.get('halt_reason'):
+                    raise SystemExit(78)
+                failures = 0 if state.get('cycle_ok') else failures + 1
+                if one_shot:
+                    if failures:
+                        raise SystemExit(1)
+                    break
+                page.wait_for_timeout(int(cycle_delay(started, POLL_INTERVAL_SECONDS, failures) * 1000))
+        finally:
+            browser.close()
 
-        mode_name = "السيرفر" if CONTINUOUS_MODE else "التشغيل المحلي"
-        send_telegram(f"✅ مراقب تذكرتي بدأ العمل على {mode_name}. الفحص الدوري كل {POLL_INTERVAL_SECONDS} ثانية.")
-        log(f"بدء المراقبة المستمرة؛ الفاصل {POLL_INTERVAL_SECONDS} ثانية")
-        while True:
-            try:
-                process(page, state, first_run=not state["baseline_done"])
-                save_state(state)
-                save_api_state()
-            except Exception as e:
-                log(f"خطأ أثناء دورة المراقبة: {e}")
-                save_api_state()
-            time.sleep(POLL_INTERVAL_SECONDS)
+
+_OUTBOX = None
+
+
+def get_outbox():
+    global _OUTBOX
+    if _OUTBOX is None:
+        _OUTBOX = DurableOutbox('tazkarti_telegram_outbox.json')
+    return _OUTBOX
+
+
+def flush_telegram():
+    if not BOT_TOKEN or not CHAT_ID:
+        if get_outbox().items:
+            log('Telegram settings missing; alerts remain queued')
+        return
+    def deliver(text):
+        data = urllib.parse.urlencode({'chat_id': CHAT_ID, 'text': text, 'disable_web_page_preview': 'true'}).encode()
+        request = urllib.request.Request(f'https://api.telegram.org/bot{BOT_TOKEN}/sendMessage', data=data, method='POST')
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read())
+        if not result.get('ok'):
+            raise RuntimeError('Telegram rejected message')
+    try:
+        get_outbox().flush(deliver)
+    except Exception as exc:
+        # URLs in exception text can contain the bot token. Never log them.
+        log(f'Telegram failed: {type(exc).__name__}; alerts remain queued')
 
 
 if __name__ == "__main__":
