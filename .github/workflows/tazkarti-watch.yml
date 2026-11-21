@@ -28,9 +28,12 @@ jobs:
       - name: Restore state
         uses: actions/cache/restore@v4
         with:
-          path: seen_tazkarti.json
-          key: tazkarti-${{ github.run_id }}
-          restore-keys: tazkarti-
+          path: |
+            seen_tazkarti.json
+            tazkarti_api_watch.json
+            tazkarti_telegram_outbox.json
+          key: tazkarti-v2-${{ github.run_id }}
+          restore-keys: tazkarti-v2-
 
       - name: Run scan
         env:
@@ -42,5 +45,8 @@ jobs:
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: seen_tazkarti.json
-          key: tazkarti-${{ github.run_id }}
+          path: |
+            seen_tazkarti.json
+            tazkarti_api_watch.json
+            tazkarti_telegram_outbox.json
+          key: tazkarti-v2-${{ github.run_id }}
